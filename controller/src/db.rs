@@ -62,13 +62,18 @@ pub async fn mark_comment_seen(
 
 /// Insert a new benchmark job with status `pending`. Returns the new row ID.
 #[tracing::instrument(skip_all, fields(pr_number = job.pr_number, job_type = job.job_type))]
-pub async fn insert_job(pool: &SqlitePool, job: &JobInsert<'_>) -> Result<i64> {
+pub async fn insert_job<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+    executor: E,
+    job: &JobInsert<'_>,
+) -> Result<i64> {
+    job.shard.validate()?;
     let result = sqlx::query(
         "INSERT INTO benchmark_jobs \
          (comment_id, repo, pr_number, pr_url, login, benchmarks, env_vars, \
           baseline_env_vars, changed_env_vars, baseline_ref, changed_ref, job_type, \
-          cpu_request, memory_request, cpu_arch) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          cpu_request, memory_request, cpu_arch, effective_shards, shard_index, \
+          assignment_version, resolved_source_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.comment_id)
     .bind(job.repo)
@@ -85,9 +90,51 @@ pub async fn insert_job(pool: &SqlitePool, job: &JobInsert<'_>) -> Result<i64> {
     .bind(job.resources.cpu.as_deref())
     .bind(job.resources.memory.as_deref())
     .bind(job.resources.arch.as_deref())
-    .execute(pool)
+    .bind(job.shard.count())
+    .bind(job.shard.index)
+    .bind((job.shard.count() > 1).then_some(crate::sharding::ASSIGNMENT_VERSION))
+    .bind(job.resolved_source_json)
+    .execute(executor)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+/// Atomically acknowledge a trigger and insert all of its independent jobs.
+/// A duplicate trigger is a no-op; a partial fan-out is never committed.
+pub async fn enqueue_jobs(
+    pool: &SqlitePool,
+    jobs: &[JobInsert<'_>],
+    created_at: &str,
+) -> Result<()> {
+    let first = jobs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("empty job batch"))?;
+    let mut tx = pool.begin().await?;
+    let seen = sqlx::query("INSERT OR IGNORE INTO seen_comments (comment_id, repo, pr_number, login, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(first.comment_id).bind(first.repo).bind(first.pr_number).bind(first.login).bind(created_at)
+        .execute(&mut *tx).await?;
+    if seen.rows_affected() == 0 {
+        return Ok(());
+    }
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM benchmark_jobs WHERE login = ? AND status = 'pending'",
+    )
+    .bind(first.login)
+    .fetch_one(&mut *tx)
+    .await?;
+    anyhow::ensure!(
+        pending + jobs.len() as i64 <= crate::config::MAX_QUEUED_PER_USER,
+        "per-user queue limit exceeded"
+    );
+    for job in jobs {
+        anyhow::ensure!(
+            job.comment_id == first.comment_id && job.login == first.login,
+            "mixed trigger batch"
+        );
+        insert_job(&mut *tx, job).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Return up to 5 oldest `pending` jobs, ordered by ID. Skips jobs whose
@@ -98,8 +145,12 @@ pub async fn get_pending_jobs(pool: &SqlitePool) -> Result<Vec<BenchmarkJob>> {
     let jobs = sqlx::query_as::<_, BenchmarkJob>(
         "SELECT * FROM benchmark_jobs p \
          WHERE p.status = 'pending' \
-           AND (SELECT COUNT(*) FROM benchmark_jobs r \
-                WHERE r.login = p.login AND r.status = 'running') < ? \
+           AND ((SELECT COUNT(*) FROM benchmark_jobs r \
+                 WHERE r.login = p.login AND r.status = 'running') \
+                + CASE WHEN p.effective_shards > 1 THEN \
+                  (SELECT COUNT(*) FROM benchmark_jobs earlier \
+                   WHERE earlier.login = p.login AND earlier.status = 'pending' AND earlier.id < p.id) \
+                  ELSE 0 END) < ? \
          ORDER BY p.id LIMIT 5",
     )
     .bind(MAX_RUNNING_PER_USER)
@@ -278,6 +329,8 @@ mod tests {
             changed_ref: None,
             job_type: "standard",
             resources: &NO_RESOURCES,
+            shard: crate::sharding::Shard::default(),
+            resolved_source_json: None,
         }
     }
 
@@ -287,6 +340,134 @@ mod tests {
         memory: None,
         arch: None,
     };
+
+    #[tokio::test]
+    async fn shard_fanout_is_atomic_idempotent_and_persists_frozen_sources() {
+        let pool = test_pool().await;
+        let sources = r#"{"baseline_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","changed_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pr_head_ref":"feature"}"#;
+        let jobs: Vec<_> = (0..4)
+            .map(|index| {
+                let mut job = test_job(5000);
+                job.shard = crate::sharding::Shard { count: 4, index };
+                job.resolved_source_json = Some(sources);
+                job
+            })
+            .collect();
+        enqueue_jobs(&pool, &jobs, "2024-01-01").await.unwrap();
+        enqueue_jobs(&pool, &jobs, "2024-01-01").await.unwrap();
+        let rows = get_pending_jobs(&pool).await.unwrap();
+        assert_eq!(rows.len(), 4);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.shard_index, i as u32);
+            assert_eq!(row.shard().unwrap().count(), 4);
+            assert_eq!(row.resolved_source_json.as_deref(), Some(sources));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fanout_rolls_back_jobs_and_seen_comment() {
+        let pool = test_pool().await;
+        let a = test_job(5001);
+        let mut invalid = test_job(5001);
+        invalid.shard.index = 1; // Invalid for the default count of one.
+        assert!(enqueue_jobs(&pool, &[a, invalid], "2024-01-01")
+            .await
+            .is_err());
+        assert!(!is_comment_seen(&pool, 5001).await.unwrap());
+        assert!(get_pending_jobs(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shard_jobs_do_not_overshoot_running_slots_in_a_batch() {
+        let pool = test_pool().await;
+        for cid in 6000..6004 {
+            mark_comment_seen(&pool, cid, "apache/datafusion", 42, "alice", "2024-01-01")
+                .await
+                .unwrap();
+            let id = insert_job(&pool, &test_job(cid)).await.unwrap();
+            update_job_status(&pool, id, JobStatus::Running, Some("running"), None)
+                .await
+                .unwrap();
+        }
+        let jobs: Vec<_> = (0..8)
+            .map(|index| {
+                let mut job = test_job(7000);
+                job.shard = crate::sharding::Shard { count: 8, index };
+                job
+            })
+            .collect();
+        enqueue_jobs(&pool, &jobs, "2024-01-01").await.unwrap();
+        assert_eq!(get_pending_jobs(&pool).await.unwrap().len(), 1);
+        assert_eq!(count_user_pending(&pool, "alice").await.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn ordinary_pending_selection_keeps_original_batch_behavior() {
+        let pool = test_pool().await;
+        for cid in 9000..9004 {
+            mark_comment_seen(&pool, cid, "apache/datafusion", 42, "alice", "2024-01-01")
+                .await
+                .unwrap();
+            let id = insert_job(&pool, &test_job(cid)).await.unwrap();
+            update_job_status(&pool, id, JobStatus::Running, Some("running"), None)
+                .await
+                .unwrap();
+        }
+        for cid in 9100..9105 {
+            mark_comment_seen(&pool, cid, "apache/datafusion", 42, "alice", "2024-01-01")
+                .await
+                .unwrap();
+            insert_job(&pool, &test_job(cid)).await.unwrap();
+        }
+        // The pre-sharding query picked a batch of five once the user was
+        // below the running cap. Do not change that policy for ordinary jobs.
+        assert_eq!(get_pending_jobs(&pool).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn effective_count_is_persisted_and_not_reinterpreted() {
+        let pool = test_pool().await;
+        // Includes single-worker plans stored before unsupported requests were rejected.
+        let job = test_job(9200);
+        let requested = Some(8);
+        enqueue_jobs(&pool, &[job], "2024-01-01").await.unwrap();
+        let rows = get_pending_jobs(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.effective_shards, 1);
+        assert_eq!(row.shard().unwrap(), crate::sharding::Shard::default());
+        assert!(row.shard_label().is_empty());
+        assert!(row.assignment_version.is_none());
+        assert!(row.resolved_source_json.is_none());
+        // Changes in setup eligibility must not reinterpret a stored execution plan.
+        assert!(crate::models::JobType::Datafusion
+            .shard_support()
+            .resolve(requested)
+            .is_err());
+        assert_eq!(
+            crate::sharding::ShardSupport::Partitioned
+                .resolve(requested)
+                .unwrap(),
+            8
+        );
+        assert_eq!(row.shard().unwrap().count(), 1);
+        assert_eq!(count_user_pending(&pool, "alice").await.unwrap(), 1);
+        assert!(
+            sqlx::query("UPDATE benchmark_jobs SET shard_index = 1 WHERE id = ?")
+                .bind(row.id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_limit_counts_all_shards() {
+        let pool = test_pool().await;
+        let jobs: Vec<_> = (0..16).map(|_| test_job(8000)).collect();
+        assert!(enqueue_jobs(&pool, &jobs, "2024-01-01").await.is_err());
+        assert!(!is_comment_seen(&pool, 8000).await.unwrap());
+    }
 
     // ── mark_comment_seen + is_comment_seen ─────────────────────────
 

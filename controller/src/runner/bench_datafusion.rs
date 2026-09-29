@@ -34,6 +34,15 @@ use tracing::{info, warn};
 use crate::github;
 use crate::runner::build_env;
 use crate::runner::config::RunnerConfig;
+use crate::runner::criterion::{Criterion, Run};
+use crate::runner::execution::{execute, partition, CommandHarness, CommandRun};
+use crate::sharding::{Shard, ShardSupport};
+
+// Mixed DataFusion harnesses/setup lack uniform discovery and batched subset
+// execution. Enable sharding once their adapters implement that shared contract.
+pub const SHARD_SUPPORT: ShardSupport = ShardSupport::SingleWorkerOnly(
+    "DataFusion setup does not yet support uniform discovery and batched subset execution",
+);
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
 use crate::runner::pool_peak::{self, BenchPeaks};
@@ -43,6 +52,7 @@ use crate::runner::trigger;
 
 /// Run DataFusion benchmarks comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
+    SHARD_SUPPORT.validate_execution(config.shard)?;
     let repo_url = config.repo_url();
     let benchmarks = &config.benchmarks;
 
@@ -229,13 +239,15 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 &config.bench_filter,
                 &baseline_extra_env,
                 required_features,
+                config.shard,
             )
             .await
             {
-                Ok(stats) => {
+                Ok(Some(stats)) => {
                     criterion_base_ok = true;
                     base_stats_list.push((bench.clone(), stats));
                 }
+                Ok(None) => {}
                 Err(e) => {
                     // Most likely a new bench target absent on the base — fall
                     // back to a branch-only comparison for it.
@@ -251,11 +263,14 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 &config.bench_filter,
                 &changed_extra_env,
                 required_features,
+                config.shard,
             )
             .await
             .with_context(|| format!("run {bench} (branch, criterion)"))?;
-            criterion_branch_ok = true;
-            branch_stats_list.push((bench.clone(), stats));
+            if let Some(stats) = stats {
+                criterion_branch_ok = true;
+                branch_stats_list.push((bench.clone(), stats));
+            }
             continue;
         }
 
@@ -275,12 +290,15 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             &base_results_name,
             &base_spill_dir,
             &baseline_extra_env,
+            config.shard,
         )
         .await
         .with_context(|| format!("run {bench} (base)"))?;
         let _ = tokio::fs::remove_dir_all(&base_spill_dir).await;
         base_peaks.extend(pool_peak::collect_new(&base_results_dir, &base_before, bench).await);
-        base_stats_list.push((bench.clone(), base_stats));
+        if let Some(stats) = base_stats {
+            base_stats_list.push((bench.clone(), stats));
+        }
 
         info!("** Running {bench} branch **");
         let branch_spill_dir = PathBuf::from(format!("/workspace/spill-branch-{bench}"));
@@ -293,13 +311,16 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             &bench_branch_name,
             &branch_spill_dir,
             &changed_extra_env,
+            config.shard,
         )
         .await
         .with_context(|| format!("run {bench} (branch)"))?;
         let _ = tokio::fs::remove_dir_all(&branch_spill_dir).await;
         branch_peaks
             .extend(pool_peak::collect_new(&branch_results_dir, &branch_before, bench).await);
-        branch_stats_list.push((bench.clone(), branch_stats));
+        if let Some(stats) = branch_stats {
+            branch_stats_list.push((bench.clone(), stats));
+        }
     }
 
     // Compare and post results, driven by the artifacts that were produced:
@@ -511,34 +532,23 @@ async fn run_criterion_side(
     bench_filter: &str,
     extra_env: &[String],
     required_features: &[String],
-) -> Result<ResourceStats> {
-    let mut bench_args: Vec<String> = vec![
-        "bench".into(),
-        criterion_features_arg(required_features),
-        "--bench".into(),
-        bench.into(),
-        "--".into(),
-        "--save-baseline".into(),
-        baseline_name.into(),
-    ];
-    if !bench_filter.is_empty() {
-        bench_args.push(bench_filter.to_string());
-    }
-    // The runner's own env already carries the forced build settings, so the
-    // plain `cargo` call inherits them; the `env` call has to re-assert them
-    // after the trigger's per-side vars.
-    let (_, stats) = if extra_env.is_empty() {
-        let args_ref: Vec<&str> = bench_args.iter().map(|s| s.as_str()).collect();
-        shell::run_command_monitored("cargo", &args_ref, side_dir, None).await?
-    } else {
-        let mut env_args: Vec<String> = extra_env.to_vec();
-        env_args.extend(build_env::args());
-        env_args.push("cargo".to_string());
-        env_args.extend(bench_args);
-        let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
-        shell::run_command_monitored("env", &env_args_ref, side_dir, None).await?
+    shard: Shard,
+) -> Result<Option<ResourceStats>> {
+    let harness = Criterion {
+        bench_args: vec![
+            "bench".into(),
+            criterion_features_arg(required_features),
+            "--bench".into(),
+            bench.into(),
+        ],
     };
-    Ok(stats)
+    let side = format!(
+        "{}-{bench}",
+        side_dir.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let plan = Run::new(&side, baseline_name, bench_filter, side_dir, extra_env);
+    let plan = partition(&harness, plan, shard, bench).await?;
+    execute(&harness, &plan).await
 }
 
 /// Run a single `bench.sh` benchmark on one side (base or branch).
@@ -559,9 +569,10 @@ async fn run_shell_side(
     results_name: &str,
     spill_dir: &Path,
     extra_env: &[String],
-) -> Result<ResourceStats> {
-    if let Some((tpch_args, results_filename)) = tpch_direct_args(bench) {
-        run_tpch_direct(
+    shard: Shard,
+) -> Result<Option<ResourceStats>> {
+    let command = if let Some((tpch_args, results_filename)) = tpch_direct_args(bench) {
+        tpch_command(
             side_dir,
             bench_benchmarks,
             results_name,
@@ -570,7 +581,7 @@ async fn run_shell_side(
             tpch_args,
             results_filename,
         )
-        .await
+        .await?
     } else {
         let mut args = shell_side_env_args(side_dir, results_name, spill_dir, extra_env);
         args.extend([
@@ -578,16 +589,15 @@ async fn run_shell_side(
             "run".to_string(),
             bench.to_string(),
         ]);
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (_, stats) = shell::run_command_monitored(
-            "env",
-            &args_ref,
-            bench_benchmarks,
-            Some(spill_dir.to_path_buf()),
-        )
-        .await?;
-        Ok(stats)
-    }
+        CommandRun {
+            program: "env".into(),
+            args,
+            cwd: bench_benchmarks.into(),
+            spill_dir: Some(spill_dir.into()),
+        }
+    };
+    let plan = partition(&CommandHarness, command, shard, bench).await?;
+    execute(&CommandHarness, &plan).await
 }
 
 /// `KEY=VALUE` args passed to `env` ahead of `./bench.sh run`. `env` applies
@@ -669,7 +679,7 @@ fn tpch_direct_args(bench: &str) -> Option<(Vec<String>, String)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_tpch_direct(
+async fn tpch_command(
     side_dir: &Path,
     bench_benchmarks: &Path,
     results_name: &str,
@@ -677,7 +687,7 @@ async fn run_tpch_direct(
     extra_env: &[String],
     tpch_args: Vec<String>,
     results_filename: String,
-) -> Result<ResourceStats> {
+) -> Result<CommandRun> {
     let dfbench = side_dir.join("target/release/dfbench");
     if !dfbench.exists() {
         anyhow::bail!("dfbench binary not found at {}", dfbench.display());
@@ -710,15 +720,12 @@ async fn run_tpch_direct(
         results_file.to_string_lossy().into_owned(),
     ]);
 
-    let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
-    let (_, stats) = shell::run_command_monitored(
-        "env",
-        &env_args_ref,
-        bench_benchmarks,
-        Some(spill_dir.to_path_buf()),
-    )
-    .await?;
-    Ok(stats)
+    Ok(CommandRun {
+        program: "env".into(),
+        args: env_args,
+        cwd: bench_benchmarks.into(),
+        spill_dir: Some(spill_dir.into()),
+    })
 }
 
 /// Datasets a Criterion bench target needs generated before it can run.

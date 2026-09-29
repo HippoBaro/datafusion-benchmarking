@@ -24,6 +24,26 @@ struct CommentConfig {
     baseline: Option<SideConfig>,
     changed: Option<SideConfig>,
     resources: Option<ResourcesConfig>,
+    #[serde(default, deserialize_with = "deserialize_shards")]
+    shards: Option<u32>,
+}
+
+fn deserialize_shards<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    // Deserialize the value, not Option, so explicit null is not omission.
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    let count = value
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| (1..=crate::sharding::MAX_SHARDS).contains(v))
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "shards must be an integer between 1 and {}",
+                crate::sharding::MAX_SHARDS
+            ))
+        })?;
+    Ok(Some(count))
 }
 
 #[derive(Deserialize, Default)]
@@ -89,6 +109,7 @@ fn parse_sections(lines: &[&str], limits: &ResourceLimits) -> Result<BenchmarkRe
     };
 
     Ok(BenchmarkRequest {
+        shards: config.shards,
         benchmarks: vec![],
         env_vars: shared_env,
         baseline_env_vars: baseline_env,
@@ -253,8 +274,17 @@ pub fn usage_message() -> String {
            cpu: \"16\"\n\
            memory: \"128Gi\"\n\
            arch: arm64          # arm64 or amd64\n\
-         ```"
-    .to_string()
+         ```\n\n\
+         Independent benchmark shards (optional; 1–8, default 1):\n\
+         ```yaml\n\
+         run benchmark arrow_writer\n\
+         shards: 4\n\
+         ```\n\
+         Each shard builds both revisions, measures its assigned cases, and posts \
+         its own report. Resources and the job deadline apply per shard. \
+         DataFusion requests specifying a shard count greater than 1 fail with \
+         an error. Omit shards or use shards: 1 for DataFusion."
+        .to_string()
 }
 
 /// Format the allowlist as a comma-separated list of GitHub profile links.
@@ -315,6 +345,46 @@ mod tests {
 
     fn is_parsed(result: &DetectResult) -> bool {
         matches!(result, DetectResult::Parsed(_))
+    }
+
+    #[test]
+    fn shard_override_is_explicit_and_strict() {
+        assert_eq!(
+            unwrap_parsed(detect("run benchmark arrow_writer")).shards,
+            None
+        );
+        for count in [1, 2, 4, 8] {
+            let req = unwrap_parsed(detect(&format!(
+                "run benchmark arrow_writer\nshards: {count}\nenv:\n  BENCH_FILTER: float"
+            )));
+            assert_eq!(req.shards, Some(count));
+            assert_eq!(req.env_vars["BENCH_FILTER"], "float");
+        }
+        for value in ["0", "-1", "9", "1.5", "\"4\"", "true", "null", "[]", "{}"] {
+            assert!(
+                matches!(
+                    detect(&format!("run benchmark arrow_writer\nshards: {value}")),
+                    DetectResult::ConfigError(_)
+                ),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn sharding_does_not_reserve_existing_benchmark_environment_names() {
+        for key in ["BENCH_SHARD", "BENCH_FROZEN_SOURCES", "BENCH_SHARD_VERSION"] {
+            for block in [
+                format!("env:\n  {key}: x"),
+                format!("baseline:\n  env:\n    {key}: x"),
+                format!("changed:\n  env:\n    {key}: x"),
+            ] {
+                assert!(matches!(
+                    detect(&format!("run benchmark arrow_writer\n{block}")),
+                    DetectResult::Parsed(_)
+                ));
+            }
+        }
     }
 
     #[test]

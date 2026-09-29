@@ -17,6 +17,7 @@ use crate::github::GitHubClient;
 use crate::resources::PodResources;
 use crate::runner::controller_client::ControllerClient;
 use crate::runner::poster::CommentPoster;
+use crate::sharding::{FrozenSources, Shard, WorkerShard};
 
 /// Benchmark runner variant, parsed from `BENCH_TYPE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,15 @@ pub enum BenchType {
 }
 
 impl BenchType {
+    pub fn shard_support(self) -> crate::sharding::ShardSupport {
+        match self {
+            Self::Datafusion | Self::MainTracking => {
+                crate::models::JobType::Datafusion.shard_support()
+            }
+            Self::ArrowCriterion => crate::models::JobType::ArrowCriterion.shard_support(),
+        }
+    }
+
     fn from_str(s: &str) -> Result<Self> {
         match s {
             // `standard`/`criterion` are legacy job-type strings that may still
@@ -84,6 +94,8 @@ pub struct RunnerConfig {
     /// trigger named, so comments can report the request rather than the
     /// defaults it left alone.
     pub resources: PodResources,
+    pub shard: Shard,
+    pub frozen_sources: Option<FrozenSources>,
 }
 
 impl RunnerConfig {
@@ -107,7 +119,19 @@ impl RunnerConfig {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        let worker = WorkerShard::from_args(std::env::args().skip(1))?;
+        let (shard, frozen_sources) = if let Some(worker) = worker {
+            BenchType::from_str(&bench_type_str)?
+                .shard_support()
+                .validate_execution(worker.shard)?;
+            (worker.shard, Some(worker.sources))
+        } else {
+            (Shard::default(), None)
+        };
+
         Ok(Self {
+            shard,
+            frozen_sources,
             pr_url,
             comment_id,
             comment_url,

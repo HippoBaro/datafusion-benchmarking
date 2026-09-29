@@ -1,25 +1,36 @@
 //! Arrow-rs criterion benchmark runner — ports `run_arrow_criterion.sh`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use tracing::{info, warn};
 
 use crate::github;
-use crate::runner::build_env;
 use crate::runner::config::RunnerConfig;
+use crate::runner::criterion::{self, Criterion, Run};
+use crate::runner::execution::{execute, partition};
 use crate::runner::git;
 use crate::runner::monitor;
 use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
 use crate::runner::trigger;
+use crate::sharding::ShardSupport;
+
+pub const SHARD_SUPPORT: ShardSupport = ShardSupport::Partitioned;
 
 /// Run an arrow-rs criterion benchmark comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     let repo_url = config.repo_url();
     let bench_name = &config.bench_name;
-    let bench_filter = &config.bench_filter;
-    let bench_command_args = bench_command_args(bench_name);
+    config.shard.validate()?;
+    let frozen = config.frozen_sources.as_ref();
+    ensure!(
+        config.shard.count() == 1 || frozen.is_some(),
+        "distributed workers require frozen commits"
+    );
+    if let Some(sources) = frozen {
+        sources.validate()?;
+    }
 
     let branch_dir = PathBuf::from("/workspace/arrow-rs-branch");
     let base_dir = PathBuf::from("/workspace/arrow-rs-base");
@@ -27,25 +38,41 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     // Clone and checkout PR branch
     info!("=== Cloning PR branch ===");
     git::clone_shallow(&repo_url, &branch_dir, 200).await?;
-    let branch_name = git::checkout_pr(&config.pr_url, &branch_dir).await?;
+    let branch_name = if let Some(sources) = frozen {
+        git::checkout_frozen(&branch_dir, &sources.changed_sha).await?;
+        sources.pr_head_ref.clone()
+    } else {
+        git::checkout_pr(&config.pr_url, &branch_dir).await?
+    };
     git::submodule_update(&branch_dir).await?;
-    let merge_base = git::merge_base(&branch_dir).await?;
+    let merge_base = if let Some(sources) = frozen {
+        sources.baseline_sha.clone()
+    } else {
+        git::merge_base(&branch_dir).await?
+    };
     let bench_branch_name = git::sanitize_branch_name(&branch_name);
     git::cargo_update(&branch_dir).await?;
-
-    // If a custom changed ref is specified, checkout that instead of PR head
-    if let Some(ref changed_ref) = config.changed_ref {
-        info!(changed_ref, "=== Checking out custom changed ref ===");
-        git::fetch_pr_ref(&config.pr_url, &branch_dir).await?;
-        git::fetch_origin(&branch_dir).await?;
-        git::checkout(&branch_dir, changed_ref).await?;
+    // Keep the original ref/update order for ordinary invocations.
+    if frozen.is_none() {
+        if let Some(ref changed_ref) = config.changed_ref {
+            info!(changed_ref, "=== Checking out custom changed ref ===");
+            git::fetch_pr_ref(&config.pr_url, &branch_dir).await?;
+            git::fetch_origin(&branch_dir).await?;
+            git::checkout(&branch_dir, changed_ref).await?;
+        }
     }
 
     // Determine baseline: custom ref or merge-base
     let baseline_display: String;
     info!("=== Cloning merge-base ===");
     git::clone_shallow(&repo_url, &base_dir, 200).await?;
-    if let Some(ref baseline_ref) = config.baseline_ref {
+    if let Some(sources) = frozen {
+        git::checkout_frozen(&base_dir, &sources.baseline_sha).await?;
+        baseline_display = config
+            .baseline_ref
+            .clone()
+            .unwrap_or_else(|| merge_base.clone());
+    } else if let Some(ref baseline_ref) = config.baseline_ref {
         info!(baseline_ref, "=== Checking out custom baseline ref ===");
         git::fetch_pr_ref(&config.pr_url, &base_dir).await?;
         git::fetch_origin(&base_dir).await?;
@@ -107,26 +134,23 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         .post_comment(&config.repo, pr_number, &running_body)
         .await?;
 
-    // Compile both in parallel
+    // Every worker builds, partitions, measures and compares in the same way.
+    // The partition operation alone decides how much of the work it owns.
     info!("=== Compiling PR branch and merge-base in parallel ===");
-    let mut branch_args = bench_command_args.clone();
-    branch_args.push("--no-run".to_string());
-    let mut base_args = bench_command_args.clone();
-    base_args.push("--no-run".to_string());
-
+    let mut build_args = bench_command_args(bench_name);
+    build_args.push("--no-run".into());
     let branch_build = shell::spawn_command(
         "cargo",
-        &str_slice(&branch_args),
+        &str_slice(&build_args),
         &branch_dir,
         "/tmp/branch_build.log",
     );
     let base_build = shell::spawn_command(
         "cargo",
-        &str_slice(&base_args),
+        &str_slice(&build_args),
         &base_dir,
         "/tmp/base_build.log",
     );
-
     branch_build
         .await
         .context("branch build task panicked")?
@@ -144,64 +168,67 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     };
     info!("=== Compilation complete ===");
 
-    // Run benchmarks sequentially, applying per-side env vars via `env` wrapper
-    let base_stats = if baseline_available {
+    let harness = Criterion {
+        bench_args: bench_command_args(bench_name),
+    };
+    let base_env = config.baseline_env_args();
+    let branch_env = config.changed_env_args();
+    let base = if baseline_available {
+        Some(
+            partition(
+                &harness,
+                Run::new("base", "main", &config.bench_filter, &base_dir, &base_env),
+                config.shard,
+                bench_name,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let branch = partition(
+        &harness,
+        Run::new(
+            "changed",
+            &bench_branch_name,
+            &config.bench_filter,
+            &branch_dir,
+            &branch_env,
+        ),
+        config.shard,
+        bench_name,
+    )
+    .await?;
+
+    let base_stats = if let Some(base) = &base {
         info!("=== Running benchmark on merge-base ===");
-        let mut base_run_args = bench_command_args.clone();
-        base_run_args.extend(["--", "--save-baseline", "main"].map(String::from));
-        if !bench_filter.is_empty() {
-            base_run_args.push(bench_filter.clone());
-        }
-        let baseline_extra_env = config.baseline_env_args();
-        let (_, stats) = if baseline_extra_env.is_empty() {
-            shell::run_command_monitored("cargo", &str_slice(&base_run_args), &base_dir, None)
-                .await?
-        } else {
-            let mut env_args: Vec<String> = baseline_extra_env;
-            env_args.extend(build_env::args());
-            env_args.push("cargo".to_string());
-            env_args.extend(base_run_args);
-            shell::run_command_monitored("env", &str_slice(&env_args), &base_dir, None).await?
-        };
-        Some(stats)
+        execute(&harness, base).await?
     } else {
         info!("=== Skipping merge-base benchmark (baseline build failed) ===");
         None
     };
-
     info!("=== Running benchmark on PR branch ===");
-    let mut branch_run_args = bench_command_args.clone();
-    branch_run_args.extend(["--", "--save-baseline"].map(String::from));
-    branch_run_args.push(bench_branch_name.clone());
-    if !bench_filter.is_empty() {
-        branch_run_args.push(bench_filter.clone());
-    }
-    let changed_extra_env = config.changed_env_args();
-    let (_, branch_stats) = if changed_extra_env.is_empty() {
-        shell::run_command_monitored("cargo", &str_slice(&branch_run_args), &branch_dir, None)
-            .await?
-    } else {
-        let mut env_args: Vec<String> = changed_extra_env;
-        env_args.extend(build_env::args());
-        env_args.push("cargo".to_string());
-        env_args.extend(branch_run_args);
-        shell::run_command_monitored("env", &str_slice(&env_args), &branch_dir, None).await?
-    };
+    let branch_stats = execute(&harness, &branch).await?;
 
-    // Compare and post results
-    let result_body = if baseline_available {
-        // Copy baselines into one target dir for critcmp
-        copy_criterion_baselines(&base_dir, &branch_dir).await;
-
-        let report = shell::run_command("critcmp", &["main", &bench_branch_name], &branch_dir)
-            .await
-            .context("critcmp")?;
-
-        let resource_section = format!(
-            "{}\n{}",
-            monitor::format_resource_comment("base (merge-base)", &base_stats.unwrap()),
-            monitor::format_resource_comment("branch", &branch_stats),
-        );
+    let report = criterion::compare(
+        base.as_ref().filter(|_| base_stats.is_some()),
+        &branch,
+        branch_stats.is_some(),
+    )
+    .await?;
+    let resource_section = [
+        ("base (merge-base)", &base_stats),
+        ("branch", &branch_stats),
+    ]
+    .into_iter()
+    .filter_map(|(name, stats)| {
+        stats
+            .as_ref()
+            .map(|stats| monitor::format_resource_comment(name, stats))
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    let result_body = if base_stats.is_some() || branch_stats.is_none() {
         format_result_comment(
             &config.comment_url,
             &comparison.line(),
@@ -214,12 +241,6 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             &footer,
         )
     } else {
-        let report = shell::run_command("critcmp", &[bench_branch_name.as_str()], &branch_dir)
-            .await
-            .context("critcmp")?;
-
-        let resource_section =
-            monitor::format_resource_comment("branch", &branch_stats).to_string();
         format_branch_only_result_comment(
             &config.comment_url,
             &comparison.line(),
@@ -247,24 +268,6 @@ fn bench_command_args(bench_name: &str) -> Vec<String> {
         "--bench".to_string(),
         bench_name.to_string(),
     ]
-}
-
-/// Copy criterion baselines from base to branch target directory.
-async fn copy_criterion_baselines(base_dir: &Path, branch_dir: &Path) {
-    let src = base_dir.join("target/criterion");
-    let dst = branch_dir.join("target/criterion");
-    if src.exists() {
-        let _ = shell::run_command(
-            "cp",
-            &[
-                "-r",
-                &format!("{}/.", src.to_string_lossy()),
-                &dst.to_string_lossy(),
-            ],
-            Path::new("/"),
-        )
-        .await;
-    }
 }
 
 /// Format the result comment body.

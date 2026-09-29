@@ -45,11 +45,21 @@ impl Comparison<'_> {
 /// which is how the default suite is requested.
 pub fn config_block(config: &RunnerConfig, bench_names: &str) -> String {
     format!(
-        "<details><summary>Run configuration</summary>\n\n\
+        "{}<details><summary>Run configuration</summary>\n\n\
          ```yaml\n\
          {}\n\
          ```\n\n\
          </details>\n\n",
+        if config.shard.count() > 1 {
+            format!(
+                "**Shard {}/{}** · assignment `{}`\n\n",
+                config.shard.index + 1,
+                config.shard.count(),
+                crate::sharding::ASSIGNMENT_VERSION
+            )
+        } else {
+            String::new()
+        },
         config_yaml(config, bench_names)
     )
 }
@@ -63,6 +73,10 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         lines.push("run benchmarks".to_string());
     } else {
         lines.push(format!("run benchmark {names}"));
+    }
+
+    if config.shard.count() > 1 {
+        lines.push(format!("shards: {}", config.shard.count()));
     }
 
     if !config.shared_env_vars.is_empty() {
@@ -178,7 +192,38 @@ mod tests {
             changed_ref: None,
             runner_repo_url: None,
             resources: PodResources::default(),
+            shard: crate::sharding::Shard::default(),
+            frozen_sources: None,
         }
+    }
+
+    #[test]
+    fn shard_override_round_trips_and_header_is_separate() {
+        for count in [1, 4] {
+            let mut cfg = config();
+            cfg.shard = crate::sharding::Shard {
+                count,
+                index: count - 1,
+            };
+            let yaml = config_yaml(&cfg, "arrow_writer");
+            assert_eq!(yaml.contains(&format!("shards: {count}")), count > 1);
+            let req = crate::benchmarks::detect_benchmark(
+                &yaml,
+                &crate::resources::ResourceLimits::default(),
+            );
+            let crate::benchmarks::DetectResult::Parsed(req) = req else {
+                panic!("invalid reproduction YAML")
+            };
+            assert_eq!(req.shards, (count > 1).then_some(count));
+            let block = config_block(&cfg, "arrow_writer");
+            assert_eq!(block.contains("**Shard"), count > 1);
+        }
+        let mut one = config();
+        one.shard.count = 1;
+        assert_eq!(
+            config_block(&one, "arrow_writer"),
+            config_block(&config(), "arrow_writer")
+        );
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
