@@ -247,7 +247,21 @@ async fn process_comment(
         return Ok(());
     }
 
-    info!(pr_number, login, benchmarks = ?request.benchmarks, "scheduling benchmark");
+    // Reject unsupported sharding before admission, source freezing or fan-out.
+    let support = repo_entry.job_type().shard_support();
+    let shard_count = match support.resolve(request.shards) {
+        Ok(count) => count,
+        Err(error) => {
+            let msg = format!(
+                "Hi @{login}, your benchmark request cannot run ({comment_url}).\n\n**Error:** {error}{footer}"
+            );
+            gh.post_comment(repo, pr_number, &msg).await?;
+            mark_seen(pool, comment, repo, pr_number).await?;
+            return Ok(());
+        }
+    };
+
+    info!(pr_number, login, benchmarks = ?request.benchmarks, requested_shards = ?request.shards, shard_count, "scheduling benchmark");
 
     // Resolve default benchmarks when "run benchmarks" is used without specific names
     let benchmarks = if request.benchmarks.is_empty() {
@@ -258,7 +272,7 @@ async fn process_comment(
 
     // Per-user queued-jobs cap. One comment can insert multiple jobs (one per
     // benchmark name); count them all against the cap before inserting any.
-    let incoming = benchmarks.len().max(1) as i64;
+    let incoming = benchmarks.len().max(1) as i64 * i64::from(shard_count);
     let pending = db::count_user_pending(pool, login).await?;
     if pending + incoming > MAX_QUEUED_PER_USER {
         let msg = rate_limit_message(login, comment_url, pending, incoming, runner_repo_url);
@@ -267,31 +281,52 @@ async fn process_comment(
         return Ok(());
     }
 
-    // Mark seen before insert_job — the FK on benchmark_jobs requires the
-    // seen_comments row to exist first.
-    mark_seen(pool, comment, repo, pr_number).await?;
+    // Only metadata is shared. Every worker independently clones, builds and
+    // discovers its cases, including workers admitted in later quota waves.
+    let resolved_sources = if shard_count > 1 {
+        match gh
+            .freeze_sources(
+                repo,
+                pr_number,
+                request.baseline_ref.as_deref(),
+                request.changed_ref.as_deref(),
+            )
+            .await
+        {
+            Ok(sources) => Some(serde_json::to_string(&sources)?),
+            Err(e) => {
+                gh.post_comment(repo, pr_number, &format!("Could not resolve immutable commits for sharding ({comment_url}): {e:#}{footer}")).await?;
+                mark_seen(pool, comment, repo, pr_number).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
     let env_vars_json = serde_json::to_string(&request.env_vars)?;
     let baseline_env_json = serde_json::to_string(&request.baseline_env_vars)?;
     let changed_env_json = serde_json::to_string(&request.changed_env_vars)?;
-
-    // The job type is per-repo (the datafusion runner resolves each name
-    // itself), so there is no per-benchmark classification.
     let job_type = repo_entry.job_type().as_str();
-
-    if benchmarks.is_empty() {
-        // No defaults configured — insert a single job (runner uses its own default)
-        let benchmarks_json = serde_json::to_string(&benchmarks)?;
-        db::insert_job(
-            pool,
-            &JobInsert {
+    let targets: Vec<String> = if benchmarks.is_empty() {
+        vec!["[]".to_string()]
+    } else {
+        benchmarks
+            .iter()
+            .map(|name| serde_json::to_string(&[name]))
+            .collect::<Result<_, _>>()?
+    };
+    let mut jobs = Vec::new();
+    for target in &targets {
+        for index in 0..shard_count {
+            jobs.push(JobInsert {
                 comment_id: comment.id,
                 repo,
                 pr_number,
                 pr_url: &pr_url,
                 login,
-                benchmarks: &benchmarks_json,
+                benchmarks: target,
                 env_vars: &env_vars_json,
                 baseline_env_vars: &baseline_env_json,
                 changed_env_vars: &changed_env_json,
@@ -299,32 +334,21 @@ async fn process_comment(
                 changed_ref: request.changed_ref.as_deref(),
                 job_type,
                 resources: &request.resources,
-            },
-        )
-        .await?;
-    } else {
-        // One job per benchmark so each runs in its own pod.
-        for bench in &benchmarks {
-            let single_bench = serde_json::to_string(&[bench])?;
-            db::insert_job(
-                pool,
-                &JobInsert {
-                    comment_id: comment.id,
-                    repo,
-                    pr_number,
-                    pr_url: &pr_url,
-                    login,
-                    benchmarks: &single_bench,
-                    env_vars: &env_vars_json,
-                    baseline_env_vars: &baseline_env_json,
-                    changed_env_vars: &changed_env_json,
-                    baseline_ref: request.baseline_ref.as_deref(),
-                    changed_ref: request.changed_ref.as_deref(),
-                    job_type,
-                    resources: &request.resources,
+                shard: crate::sharding::Shard {
+                    count: shard_count,
+                    index,
                 },
-            )
-            .await?;
+                resolved_source_json: resolved_sources.as_deref(),
+            });
+        }
+    }
+    if shard_count > 1 {
+        db::enqueue_jobs(pool, &jobs, comment.created_at_str()).await?;
+    } else {
+        // Preserve ordinary invocation ingestion; atomic fan-out is opt-in.
+        mark_seen(pool, comment, repo, pr_number).await?;
+        for job in &jobs {
+            db::insert_job(pool, job).await?;
         }
     }
 
@@ -395,12 +419,13 @@ fn format_queue_message(
                 String::new()
             };
             lines.push(format!(
-                "| {} | {} | #{} | {} | {} |{} {} |",
+                "| {} | {} | #{} | {} | {}{} |{} {} |",
                 comment_link,
                 job.repo,
                 job.pr_number,
                 job.login,
                 job.benchmarks,
+                job.shard_label(),
                 resources,
                 job.status
             ));
@@ -466,6 +491,142 @@ mod tests {
         assert!(msg.contains("per-user queue limit of 15"));
     }
 
+    #[tokio::test]
+    async fn unsupported_setup_is_rejected_before_admission_freezing_and_fanout() {
+        use crate::config::BenchmarkConfig;
+        use crate::models::GitHubUser;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gh = GitHubClient::test_client(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut bytes = Vec::new();
+            let body_start = loop {
+                let mut buffer = [0; 2048];
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            // Only an error comment: no PR/ref resolution, quota rejection or reaction.
+            let headers = String::from_utf8_lossy(&bytes[..body_start]);
+            assert!(headers.starts_with("POST /repos/test/repo/issues/42/comments HTTP/1.1\r\n"));
+            let length: usize = headers
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .unwrap()
+                .1
+                .trim()
+                .parse()
+                .unwrap();
+            let received = bytes.len();
+            bytes.resize(body_start + length, 0);
+            socket.read_exact(&mut bytes[received..]).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes[body_start..]).unwrap();
+            let message = json["body"].as_str().unwrap();
+            assert!(message.contains("DataFusion"));
+            assert!(message.contains("shards greater than 1 are not supported"));
+            assert!(message.contains("shards: 1"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        let config = Config {
+            github_token: "unused".into(),
+            database_url: "sqlite::memory:".into(),
+            benchmark_config: BenchmarkConfig {
+                allowed_users: ["alice".into()].into(),
+                repos: Default::default(),
+            },
+            poll_interval_secs: 2,
+            reconcile_interval_secs: 3,
+            k8s_namespace: "test".into(),
+            runner_image: "unused".into(),
+            default_cpu: "12".into(),
+            default_memory: "65Gi".into(),
+            ephemeral_storage: "128Gi".into(),
+            default_machine_family: "c4a".into(),
+            resource_limits: Default::default(),
+            active_deadline_secs: 7200,
+            ttl_after_finished_secs: 3600,
+            storage_class: "unused".into(),
+            sccache_gcs_bucket: None,
+            data_cache_bucket: None,
+            runner_repo_url: None,
+        };
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let resources = PodResources::default();
+        // Only one slot remains: unsupported sharding must win over a quota error.
+        for id in 1..MAX_QUEUED_PER_USER {
+            db::mark_comment_seen(&pool, id, "test/repo", 42, "alice", "2024-01-01")
+                .await
+                .unwrap();
+            db::insert_job(
+                &pool,
+                &JobInsert {
+                    comment_id: id,
+                    repo: "test/repo",
+                    pr_number: 42,
+                    pr_url: "https://github.com/test/repo/pull/42",
+                    login: "alice",
+                    benchmarks: "[\"tpch\"]",
+                    env_vars: "{}",
+                    baseline_env_vars: "{}",
+                    changed_env_vars: "{}",
+                    baseline_ref: None,
+                    changed_ref: None,
+                    job_type: "datafusion",
+                    resources: &resources,
+                    shard: Default::default(),
+                    resolved_source_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let comment = GitHubComment {
+            id: 90000,
+            body: Some("run benchmark tpch\nshards: 8".into()),
+            user: Some(GitHubUser {
+                login: "alice".into(),
+            }),
+            html_url: Some("https://github.com/test/repo/pull/42#issuecomment-90000".into()),
+            created_at: Some("2024-01-01".into()),
+            issue_url: Some("https://api.github.com/repos/test/repo/issues/42".into()),
+        };
+        let entry = RepoEntry {
+            kind: "datafusion".into(),
+            default_standard: vec![],
+        };
+        process_comment(&pool, &gh, &config, "test/repo", &entry, &comment)
+            .await
+            .unwrap();
+        process_comment(&pool, &gh, &config, "test/repo", &entry, &comment)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let rows = sqlx::query_as::<_, BenchmarkJob>(
+            "SELECT * FROM benchmark_jobs WHERE comment_id = 90000",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+        assert!(db::is_comment_seen(&pool, comment.id).await.unwrap());
+        assert_eq!(
+            db::count_user_pending(&pool, "alice").await.unwrap(),
+            MAX_QUEUED_PER_USER - 1
+        );
+    }
+
     // ── format_queue_message ────────────────────────────────────────
 
     #[test]
@@ -498,7 +659,20 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             runner_token: None,
+            effective_shards: 1,
+            shard_index: 0,
+            assignment_version: None,
+            resolved_source_json: None,
         }
+    }
+
+    #[test]
+    fn format_queue_identifies_shards() {
+        let mut job = test_job();
+        job.effective_shards = 4;
+        job.shard_index = 1;
+        let msg = format_queue_message("alice", "https://example.com/c/1", &[job]);
+        assert!(msg.contains("shard 2/4"));
     }
 
     #[test]

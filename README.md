@@ -66,6 +66,31 @@ env:
   BENCH_FILTER: float
 ```
 
+### Benchmark sharding
+
+```yaml
+run benchmark arrow_writer
+shards: 4
+```
+
+`shards` accepts a value from **1–8**, defaulting to **1**. When set above 1,
+multiple benchmark workers execute in parallel, with each worker responsible for
+a subset of the benchmark cases. Distributed workers share the same frozen
+commit SHAs, and independently clone, build, discover, and measure their
+assigned cases.
+
+Omitting `shards` is equivalent to setting it to `1`, resulting in a single
+benchmark worker that executes all matching cases.
+
+Existing filters, ref/resource overrides, native execution order, and sequential
+baseline/changed measurement continue to apply.
+
+**DataFusion benchmarks are not currently eligible for sharding** because their
+mixed harnesses do not provide a uniform way to enumerate individual cases and
+execute arbitrary subsets without starting a separate process for each case.
+DataFusion requests specifying a shard count greater than 1 therefore fail with
+an error.
+
 ### Comparing specific branches or commits
 
 By default, benchmarks compare the PR's merge base (baseline) against the PR head (changed). You can override either side with any git ref (branch, tag, or commit SHA) using YAML:

@@ -29,3 +29,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 backon = "1"
 serde_yaml = "0.9"
 libc = "0.2"
+sha2 = "0.10"

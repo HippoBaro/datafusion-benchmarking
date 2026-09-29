@@ -8,3 +8,4 @@ pub mod job_manager;
 pub mod models;
 pub mod resources;
 pub mod runner;
+pub mod sharding;

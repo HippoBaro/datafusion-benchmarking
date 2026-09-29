@@ -98,11 +98,17 @@ async fn reconcile_pending(
         // no GitHub credentials) doesn't need to call `gh pr view`. A
         // lookup failure is not fatal — we fall back to an empty value and
         // the runner will error cleanly if it actually needs it.
-        let pr_head_ref = match gh.get_pr_head_ref(&job.repo, job.pr_number).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(comment_id = job.comment_id, error = %e, "failed to resolve PR head ref");
-                String::new()
+        // Capped requests still need the normal single-worker PR lookup.
+        let pr_head_ref = if job.effective_shards > 1 {
+            // Sharded workers use the source identities frozen at ingestion.
+            String::new()
+        } else {
+            match gh.get_pr_head_ref(&job.repo, job.pr_number).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(comment_id = job.comment_id, error = %e, "failed to resolve PR head ref");
+                    String::new()
+                }
             }
         };
 
@@ -126,7 +132,8 @@ async fn reconcile_pending(
                 let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
                 let footer = github::issues_footer(config.runner_repo_url.as_deref());
                 let msg = format!(
-                    "Failed to start benchmark for [this request]({comment_url}): {e}{footer}"
+                    "Failed to start benchmark{} for [this request]({comment_url}): {e}{footer}",
+                    job.shard_label()
                 );
                 if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
                     warn!(error = %e, "failed to post error comment");
@@ -265,9 +272,13 @@ fn terminal_failure_comment_body(
     k8s_message: &str,
     log_tail: &str,
 ) -> String {
-    let benchmarks = serde_json::from_str::<Vec<String>>(&job.benchmarks)
-        .map(|v| v.join(", "))
-        .unwrap_or_else(|_| job.benchmarks.clone());
+    let benchmarks = format!(
+        "{}{}",
+        serde_json::from_str::<Vec<String>>(&job.benchmarks)
+            .map(|v| v.join(", "))
+            .unwrap_or_else(|_| job.benchmarks.clone()),
+        job.shard_label()
+    );
     let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
     let footer = github::issues_footer(runner_repo_url);
     let k8s_detail = if k8s_message.is_empty() {
@@ -373,6 +384,30 @@ fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
         value: Some(value.into()),
         ..Default::default()
     }
+}
+
+/// Keep all new protocol metadata out of the benchmark's environment. No
+/// arguments are added for omitted shards or an explicit count of one.
+fn shard_args(job: &BenchmarkJob) -> Result<Option<Vec<String>>> {
+    let shard = job.shard()?;
+    if shard.count() == 1 {
+        return Ok(None);
+    }
+    let sources: crate::sharding::FrozenSources = serde_json::from_str(
+        job.resolved_source_json
+            .as_deref()
+            .context("missing frozen shard sources")?,
+    )?;
+    sources.validate()?;
+    let config = crate::sharding::WorkerShard {
+        version: crate::sharding::ASSIGNMENT_VERSION.into(),
+        shard,
+        sources,
+    };
+    Ok(Some(vec![
+        crate::sharding::WORKER_FLAG.into(),
+        serde_json::to_string(&config)?,
+    ]))
 }
 
 /// Generate a random 32-byte hex token used to authenticate the runner
@@ -490,6 +525,7 @@ async fn create_k8s_job(
     pr_head_ref: &str,
 ) -> Result<String> {
     let benchmarks: Vec<String> = serde_json::from_str(&job.benchmarks)?;
+    let args = shard_args(job)?;
 
     // Parse shared env vars — accept both legacy `["K=V"]` array and new `{"K":"V"}` map
     let shared_env_vars: std::collections::HashMap<String, String> =
@@ -727,6 +763,7 @@ async fn create_k8s_job(
                     containers: vec![Container {
                         name: "runner".into(),
                         image: Some(config.runner_image.clone()),
+                        args,
                         env: Some(env),
                         resources: Some(ResourceRequirements {
                             requests: Some(resource_requests),
@@ -856,7 +893,37 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             runner_token: None,
+            effective_shards: 1,
+            shard_index: 0,
+            assignment_version: None,
+            resolved_source_json: None,
         }
+    }
+
+    #[test]
+    fn no_worker_arguments_without_multiple_shards() {
+        let mut job = test_job();
+        assert!(shard_args(&job).unwrap().is_none());
+        assert!(job.shard_label().is_empty());
+        job.effective_shards = 2;
+        job.assignment_version = Some(crate::sharding::ASSIGNMENT_VERSION.into());
+        job.resolved_source_json = Some(
+            serde_json::to_string(&crate::sharding::FrozenSources {
+                baseline_sha: "a".repeat(40),
+                changed_sha: "b".repeat(40),
+                pr_head_ref: "branch".into(),
+            })
+            .unwrap(),
+        );
+        let args = shard_args(&job).unwrap().unwrap();
+        assert_eq!(
+            crate::sharding::WorkerShard::from_args(args.into_iter())
+                .unwrap()
+                .unwrap()
+                .shard
+                .count(),
+            2
+        );
     }
 
     /// Every field falls back to the controller default.
@@ -916,6 +983,17 @@ mod tests {
         let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
         assert_eq!(placement.machine_family, "c4");
         assert_eq!(placement.arch, "amd64");
+    }
+
+    #[test]
+    fn shard_timeout_identifies_the_independent_worker() {
+        let mut job = test_job();
+        job.effective_shards = 4;
+        job.shard_index = 2;
+        job.assignment_version = Some(crate::sharding::ASSIGNMENT_VERSION.into());
+        let body = terminal_failure_comment_body(7200, None, &job, "DeadlineExceeded", "", "");
+        assert!(body.contains("shard 3/4"));
+        assert!(body.contains("7200s job deadline"));
     }
 
     #[test]
