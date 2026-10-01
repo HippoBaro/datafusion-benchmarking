@@ -542,11 +542,7 @@ async fn run_criterion_side(
             bench.into(),
         ],
     };
-    let side = format!(
-        "{}-{bench}",
-        side_dir.file_name().unwrap_or_default().to_string_lossy()
-    );
-    let plan = Run::new(&side, baseline_name, bench_filter, side_dir, extra_env);
+    let plan = Run::new(baseline_name, bench_filter, side_dir, extra_env);
     let plan = partition(&harness, plan, shard, bench).await?;
     execute(&harness, &plan).await
 }

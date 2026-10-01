@@ -2,7 +2,8 @@
 FROM rust:1-bookworm AS tools
 
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
-    && cargo binstall -y --no-symlinks critcmp tpchgen-cli sccache
+    && cargo binstall -y --no-symlinks --version 0.1.8 critcmp \
+    && cargo binstall -y --no-symlinks tpchgen-cli sccache
 
 # ── Stage 2: build bench-cache binary ──
 FROM rust:1-bookworm AS bench-cache

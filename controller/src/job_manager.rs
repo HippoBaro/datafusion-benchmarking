@@ -62,6 +62,11 @@ pub async fn reconcile_loop(
         if let Err(e) = reconcile_active(&config, &pool, &gh, &kube_client).await {
             warn!(error = %e, "reconcile active error");
         }
+        if let Err(e) =
+            crate::shard_reporting::reconcile(&pool, &gh, config.runner_repo_url.as_deref()).await
+        {
+            warn!(error = %e, "reconcile shard reporting error");
+        }
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = token.cancelled() => {
@@ -85,6 +90,19 @@ async fn reconcile_pending(
     let jobs_api: Api<Job> = Api::namespaced(kube.clone(), &config.k8s_namespace);
 
     for job in pending {
+        if job.uses_collected_results() {
+            if let Err(e) = crate::shard_reporting::ensure_started(
+                pool,
+                gh,
+                &job,
+                config.runner_repo_url.as_deref(),
+            )
+            .await
+            {
+                warn!(comment_id = job.comment_id, error = %e, "failed to post request start; leaving worker pending");
+                continue;
+            }
+        }
         // Generate the per-job runner token before creating the pod so the
         // token the pod ships with matches the row in SQLite. If the DB
         // write fails we don't attempt to create the K8s Job.
@@ -98,8 +116,7 @@ async fn reconcile_pending(
         // no GitHub credentials) doesn't need to call `gh pr view`. A
         // lookup failure is not fatal — we fall back to an empty value and
         // the runner will error cleanly if it actually needs it.
-        // Capped requests still need the normal single-worker PR lookup.
-        let pr_head_ref = if job.effective_shards > 1 {
+        let pr_head_ref = if job.uses_collected_results() {
             // Sharded workers use the source identities frozen at ingestion.
             String::new()
         } else {
@@ -135,8 +152,10 @@ async fn reconcile_pending(
                     "Failed to start benchmark{} for [this request]({comment_url}): {e}{footer}",
                     job.shard_label()
                 );
-                if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
-                    warn!(error = %e, "failed to post error comment");
+                if !job.uses_collected_results() {
+                    if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
+                        warn!(error = %e, "failed to post error comment");
+                    }
                 }
             }
         }
@@ -202,7 +221,8 @@ async fn reconcile_active(
                     // A terminal K8s failure can kill the runner before it
                     // posts its own error comment. Notify from this reliable
                     // controller-owned lifecycle boundary instead.
-                    post_terminal_failure_comment(config, gh, kube, &job, reason, message).await;
+                    post_terminal_failure_comment(config, pool, gh, kube, &job, reason, message)
+                        .await;
                 }
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -235,6 +255,7 @@ async fn reconcile_active(
 /// failed, and retrying here could create duplicate comments.
 async fn post_terminal_failure_comment(
     config: &Config,
+    pool: &SqlitePool,
     gh: &GitHubClient,
     kube: &KubeClient,
     job: &BenchmarkJob,
@@ -253,6 +274,16 @@ async fn post_terminal_failure_comment(
         k8s_message,
         &log_tail,
     );
+    if job.uses_collected_results() {
+        // Preserve the controller-owned log/deadline diagnostics for the one
+        // final target notification, even when the runner never submitted.
+        if let Err(e) =
+            db::update_job_status(pool, job.id, JobStatus::Failed, None, Some(&body)).await
+        {
+            warn!(job_id = job.id, error = %e, "failed to persist shard failure detail");
+        }
+        return;
+    }
     if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &body).await {
         warn!(
             comment_id = job.comment_id,
@@ -386,13 +417,12 @@ fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
     }
 }
 
-/// Keep all new protocol metadata out of the benchmark's environment. No
-/// arguments are added for omitted shards or an explicit count of one.
+/// Keep all new protocol metadata out of the benchmark's environment.
 fn shard_args(job: &BenchmarkJob) -> Result<Option<Vec<String>>> {
-    let shard = job.shard()?;
-    if shard.count() == 1 {
+    if !job.uses_collected_results() {
         return Ok(None);
     }
+    let shard = job.shard()?;
     let sources: crate::sharding::FrozenSources = serde_json::from_str(
         job.resolved_source_json
             .as_deref()
@@ -901,11 +931,11 @@ mod tests {
     }
 
     #[test]
-    fn no_worker_arguments_without_multiple_shards() {
+    fn criterion_worker_arguments_use_one_protocol_at_every_count() {
         let mut job = test_job();
         assert!(shard_args(&job).unwrap().is_none());
         assert!(job.shard_label().is_empty());
-        job.effective_shards = 2;
+        job.job_type = "arrow_criterion".into();
         job.assignment_version = Some(crate::sharding::ASSIGNMENT_VERSION.into());
         job.resolved_source_json = Some(
             serde_json::to_string(&crate::sharding::FrozenSources {
@@ -915,15 +945,15 @@ mod tests {
             })
             .unwrap(),
         );
-        let args = shard_args(&job).unwrap().unwrap();
-        assert_eq!(
-            crate::sharding::WorkerShard::from_args(args.into_iter())
+        for count in [1, 2, 4, 8] {
+            job.effective_shards = count;
+            let args = shard_args(&job).unwrap().unwrap();
+            let worker = crate::sharding::WorkerShard::from_args(args.into_iter())
                 .unwrap()
-                .unwrap()
-                .shard
-                .count(),
-            2
-        );
+                .unwrap();
+            assert_eq!(worker.shard.count(), count);
+            assert_eq!(worker.sources.changed_sha, "b".repeat(40));
+        }
     }
 
     /// Every field falls back to the controller default.

@@ -148,8 +148,7 @@ impl FrozenSources {
     }
 }
 
-/// Internal runner arguments, not benchmark environment variables. Unsharded
-/// pods receive no extra arguments and retain their original environment.
+/// Internal runner arguments, not benchmark environment variables.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerShard {
@@ -172,10 +171,7 @@ impl WorkerShard {
                 value.version == ASSIGNMENT_VERSION,
                 "unsupported shard assignment version"
             );
-            ensure!(
-                value.shard.validate()?.count() > 1,
-                "worker shard configuration requires multiple shards"
-            );
+            value.shard.validate()?;
             value.sources.validate()?;
             config = Some(value);
         }

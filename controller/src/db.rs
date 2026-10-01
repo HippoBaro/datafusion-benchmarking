@@ -128,10 +128,21 @@ pub async fn enqueue_jobs(
     );
     for job in jobs {
         anyhow::ensure!(
-            job.comment_id == first.comment_id && job.login == first.login,
+            job.comment_id == first.comment_id
+                && job.login == first.login
+                && job.repo == first.repo
+                && job.pr_number == first.pr_number
+                && job.job_type == first.job_type
+                && job.shard.count() == first.shard.count(),
             "mixed trigger batch"
         );
         insert_job(&mut *tx, job).await?;
+    }
+    if first.job_type == crate::models::JobType::ArrowCriterion.as_str() {
+        sqlx::query("INSERT INTO sharded_runs (comment_id, benchmarks) SELECT DISTINCT comment_id, benchmarks FROM benchmark_jobs WHERE comment_id = ?")
+            .bind(first.comment_id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -284,6 +295,8 @@ pub async fn cleanup_old_jobs(pool: &SqlitePool, retention_days: i64) -> Result<
     .bind(retention_days)
     .execute(pool)
     .await?;
+    sqlx::query("DELETE FROM sharded_runs WHERE NOT EXISTS (SELECT 1 FROM benchmark_jobs WHERE benchmark_jobs.comment_id = sharded_runs.comment_id AND benchmark_jobs.benchmarks = sharded_runs.benchmarks)")
+        .execute(pool).await?;
     Ok(result.rows_affected())
 }
 
