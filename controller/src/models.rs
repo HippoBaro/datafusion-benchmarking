@@ -74,6 +74,10 @@ pub struct BenchmarkJob {
 }
 
 impl BenchmarkJob {
+    pub fn uses_collected_results(&self) -> bool {
+        self.job_type == JobType::ArrowCriterion.as_str()
+    }
+
     pub fn shard(&self) -> anyhow::Result<Shard> {
         let shard = Shard {
             count: self.effective_shards,

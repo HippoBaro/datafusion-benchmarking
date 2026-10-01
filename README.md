@@ -330,6 +330,8 @@ controller/                Rust controller crate
     github.rs              GitHub REST API client
     github_poller.rs       Comment polling loop
     job_manager.rs         K8s Job lifecycle reconciler
+    shard_reporting.rs     Durable Criterion export collection and per-target notifications
+    criterion_report.rs    Shared native comparison and per-runner report formatting
     db.rs                  SQLite queries (jobs, seen comments, scan state)
     benchmarks.rs          Trigger parsing (no allowlist — any name is accepted)
   migrations/              SQLite schema
@@ -353,6 +355,13 @@ cargo clippy --manifest-path controller/Cargo.toml -- -D warnings
 
 ```bash
 cargo test --manifest-path controller/Cargo.toml
+```
+
+The shard-report integration tests exercise the real `critcmp` binary:
+
+```bash
+cargo install critcmp --version 0.1.8 --locked
+cargo test --workspace -- --include-ignored
 ```
 
 ## Running Locally

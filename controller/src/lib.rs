@@ -1,5 +1,6 @@
 pub mod benchmarks;
 pub mod config;
+pub mod criterion_report;
 pub mod db;
 pub mod github;
 pub mod github_poller;
@@ -8,4 +9,5 @@ pub mod job_manager;
 pub mod models;
 pub mod resources;
 pub mod runner;
+pub mod shard_reporting;
 pub mod sharding;

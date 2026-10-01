@@ -257,6 +257,50 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Publish a controller-owned notification once. The reconciliation loop is
+    /// the sole caller. A marker lets the next pass recover when GitHub accepted
+    /// a POST but the response or subsequent SQLite write was lost.
+    ///
+    /// Unlike ordinary comments, never retry this POST blindly: look it up first
+    /// on the next reconciliation pass instead.
+    pub async fn ensure_run_comment(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        marker: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let url = format!("{API_BASE}/repos/{repo}/issues/{pr_number}/comments");
+        for page in 1..=MAX_PAGES {
+            let comments: Vec<GitHubComment> = self
+                .get_with_retry(&url, &[("per_page", "100"), ("page", &page.to_string())])
+                .await?
+                .json()
+                .await?;
+            if let Some(comment) = comments.iter().find(|c| c.body_text().ends_with(marker)) {
+                return Ok(comment.id);
+            }
+            if comments.len() < 100 {
+                #[cfg(test)]
+                let url = match &self.api_base {
+                    Some(base) => url.replacen(API_BASE, base, 1),
+                    None => url.clone(),
+                };
+                let response = self
+                    .request_builder(self.client.post(&url))
+                    .json(&serde_json::json!({"body": format!("{body}\n\n{marker}")}))
+                    .send()
+                    .await?;
+                let comment: GitHubComment = Self::check_response(response, "POST notification")
+                    .await?
+                    .json()
+                    .await?;
+                return Ok(comment.id);
+            }
+        }
+        anyhow::bail!("comment pagination limit reached; refusing to risk a duplicate notification")
+    }
+
     /// Look up a PR and return its `head.ref` (the source branch name).
     /// Runner pods no longer have a `GITHUB_TOKEN`, so the controller
     /// resolves this once and passes it to the pod via `PR_HEAD_REF`.

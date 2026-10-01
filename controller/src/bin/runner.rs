@@ -54,7 +54,7 @@ async fn main() {
         // step ("run multi_group_by (branch, criterion)"); the command's own
         // stderr, which says what actually went wrong, is further down it.
         error!(error = %format!("{e:#}"), "benchmark failed");
-        if runner_posts_failure_comment(&config.poster_mode) {
+        if runner_posts_failure_comment(&config.poster_mode, config.bench_type) {
             post_error_comment(&config, &poster).await;
         }
         std::process::exit(1);
@@ -66,8 +66,9 @@ async fn main() {
 
 /// Proxy-mode runs are reconciled by the controller, which owns their
 /// terminal failure notification. Direct runs have no controller job record.
-fn runner_posts_failure_comment(poster_mode: &PosterMode) -> bool {
-    matches!(poster_mode, PosterMode::Direct { .. })
+/// Arrow uses its shared report formatter for direct failures.
+fn runner_posts_failure_comment(poster_mode: &PosterMode, bench_type: BenchType) -> bool {
+    bench_type != BenchType::ArrowCriterion && matches!(poster_mode, PosterMode::Direct { .. })
 }
 
 async fn run_benchmark(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
@@ -128,7 +129,7 @@ mod tests {
             token: "token".to_string(),
         };
 
-        assert!(!runner_posts_failure_comment(&mode));
+        assert!(!runner_posts_failure_comment(&mode, BenchType::Datafusion));
     }
 
     #[test]
@@ -137,6 +138,11 @@ mod tests {
             github_token: "token".to_string(),
         };
 
-        assert!(runner_posts_failure_comment(&mode));
+        assert!(runner_posts_failure_comment(&mode, BenchType::Datafusion));
+        assert!(runner_posts_failure_comment(&mode, BenchType::MainTracking));
+        assert!(!runner_posts_failure_comment(
+            &mode,
+            BenchType::ArrowCriterion
+        ));
     }
 }
